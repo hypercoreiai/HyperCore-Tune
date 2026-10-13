@@ -108,6 +108,10 @@ that already exist, without booting the engine.
 
 - the deliverable is a run config in `setup.py`'s shape; keys the model's own config
   carries that setup does not own (`sampling`, `reasoning`, `mcp_servers`, ...) are kept
+- a key is only written when this project's server can read it: `strata_env.server_flags()`
+  reads the flags `serve/server.py` defines, so a flag from an older release (for example
+  `turn_tail_check`, which Strata's server does not have) is left out rather than passed
+  to argparse and rejected at startup
 - the launcher uses the backend name the local `serve/server.py` accepts, read from its
   own `--engine` choices
 - the model's existing `strata-<model>.json` is used as the base for the new config
