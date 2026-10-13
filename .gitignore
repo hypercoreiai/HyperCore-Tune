@@ -8,6 +8,9 @@ max_run_*.bat
 max_run_*.pid
 max_run_*.fifo
 
+# session bookkeeping, not project source
+.mcp_test_state.json
+
 # Python
 __pycache__/
 *.pyc
