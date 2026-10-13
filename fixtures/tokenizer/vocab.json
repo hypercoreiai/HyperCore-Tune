@@ -1,0 +1,5 @@
+{
+  "model": "stub",
+  "vocab": ["hello", "world"],
+  "note": "A tokenizer beside the fixture pack, so the deliverable carries one."
+}

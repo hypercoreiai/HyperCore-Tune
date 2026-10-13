@@ -1,0 +1,18 @@
+# Run data and deliverables are machine-specific: they stay on the box that measured them.
+results/
+history/
+*.log
+max_run_*.json
+max_run_*.sh
+max_run_*.bat
+max_run_*.pid
+max_run_*.fifo
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/

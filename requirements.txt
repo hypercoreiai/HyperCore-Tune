@@ -1,0 +1,7 @@
+# HyperCore-Tune: the packages the sweep needs, on top of the Strata venv.
+# optuna is deliberately not in Strata's requirements.txt: tuning is optional.
+optuna>=3.6
+psutil>=5.9
+
+# tests
+pytest>=8.0
