@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""optuna_tune/stub_engine_slow.py - a stub that stays up, like the real --serve engine.
+"""HyperCore-Tune/stub_engine_slow.py - a stub that stays up, like the real --serve engine.
 
 Reads "GEN <max_new> <ids>" on stdin and answers with a DONE line, taking --delay seconds
 per request. Used by the tests that need a run long enough to interrupt, and by the test

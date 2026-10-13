@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""optuna_tune/stub_engine_exit.py - prints INFO, then exits without ever serving.
+"""HyperCore-Tune/stub_engine_exit.py - prints INFO, then exits without ever serving.
 
 This is the shape of a real boot failure (the draft head does not fit, an allocation
 fails), and it is the case that used to raise BrokenPipeError when the request pipe was

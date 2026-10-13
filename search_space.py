@@ -336,7 +336,7 @@ def resolve_model_paths(root: Path, model: str, data_dir: str | None = None) -> 
     missing = [k for k in ("pack", "native") if not getattr(paths, k)]
     if missing:
         raise FileNotFoundError(
-            "optuna_tune: could not find " + ", ".join(missing) + f" for model '{model}'. "
+            "HyperCore-Tune: could not find " + ", ".join(missing) + f" for model '{model}'. "
             "Looked in: " + ", ".join(candidates) + ". Pass --pack/--native explicitly."
         )
     return paths

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""optuna_tune/stub_engine.py - a deterministic stand-in for engine/hypercore.
+"""HyperCore-Tune/stub_engine.py - a deterministic stand-in for engine/hypercore.
 
 Speaks the same protocol as the real engine with --serve: it prints an INFO line, says
 "session is up", reads "GEN <max_new> <token ids>" on stdin, answers with a DONE line,
 and stays up until QUIT. The numbers are a smooth function of the swept flags with a
 single interior optimum, which is what a Bayesian sampler needs to show convergence.
 
-    ./optuna_tune/stub_engine.py --serve --max-context 131072 --kv q4_0 --pool-workers 8
+    ./HyperCore-Tune/stub_engine.py --serve --max-context 131072 --kv q4_0 --pool-workers 8
 """
 from __future__ import annotations
 

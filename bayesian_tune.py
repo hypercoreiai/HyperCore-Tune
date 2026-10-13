@@ -546,9 +546,9 @@ def _hardware(spec: str | None) -> Hardware:
         raw = json.loads(Path(spec).read_text(encoding="utf-8")) if Path(spec).is_file() \
             else json.loads(spec)
     except (OSError, ValueError) as exc:
-        raise SystemExit(f"optuna_tune: --hardware is not valid JSON: {exc}") from exc
+        raise SystemExit(f"HyperCore-Tune: --hardware is not valid JSON: {exc}") from exc
     if not isinstance(raw, dict):
-        raise SystemExit("optuna_tune: --hardware must be a JSON object")
+        raise SystemExit("HyperCore-Tune: --hardware must be a JSON object")
     return hardware_from(raw)
 
 
@@ -607,7 +607,7 @@ def rebuild_from_records(args: argparse.Namespace, paths: ModelPaths, hw: Hardwa
     row = best_from_records(Path(args.results_dir), args.model, args.objective)
     if row is None:
         raise SystemExit(
-            f"optuna_tune: no measured (status PASS) trial for model {args.model} "
+            f"HyperCore-Tune: no measured (status PASS) trial for model {args.model} "
             f"objective {args.objective} in {args.results_dir}"
         )
     engine = engine_args(row.cfg, paths.as_dict(), args.cntx, args.max_new, args.spec_min_p)
@@ -665,12 +665,12 @@ def replay(record_path: Path, args: argparse.Namespace, paths: ModelPaths,
     """
     record = load_history(record_path)
     if record is None:
-        raise SystemExit(f"optuna_tune: {record_path} is not a readable tuning record")
+        raise SystemExit(f"HyperCore-Tune: {record_path} is not a readable tuning record")
     if not record.get("best") or not record.get("args"):
-        raise SystemExit(f"optuna_tune: {record_path} has no winning configuration to replay")
+        raise SystemExit(f"HyperCore-Tune: {record_path} has no winning configuration to replay")
     if not record.get("verified", any(t.get("status") == "PASS" for t in record.get("trials", []))):
         raise SystemExit(
-            f"optuna_tune: {record_path} has no measured trial behind its best; "
+            f"HyperCore-Tune: {record_path} has no measured trial behind its best; "
             "use --from-records to rebuild from the CSVs instead"
         )
     record.setdefault("hardware", hw.to_dict())
@@ -712,7 +712,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths.prompt_tokens = args.prompt_tokens_file
     if not paths.prompt_tokens:
         raise SystemExit(
-            "optuna_tune: no prompt token file found. Pass --prompt-tokens-file <json with an 'input' list> "
+            "HyperCore-Tune: no prompt token file found. Pass --prompt-tokens-file <json with an 'input' list> "
             "(bench/results/exchange-rotation-token-ids.json is the usual one)."
         )
     args.prompt_tokens_file = paths.prompt_tokens
