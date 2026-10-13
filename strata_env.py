@@ -136,6 +136,31 @@ def venv_python(root: Path | None = None) -> str:
     return ""
 
 
+@lru_cache(maxsize=8)
+def server_flags(root: Path) -> frozenset[str]:
+    """The --flags serve/server.py defines, read from its own argparse block.
+
+    Empty when the file cannot be read. Cached per root; the server is not going to
+    change while a sweep is running.
+    """
+    try:
+        text = (root / "serve" / "server.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return frozenset()
+    return frozenset(re.findall(r'add_argument\(\s*"(--[A-Za-z0-9-]+)"', text))
+
+
+def server_supports(flag: str, root: Path | None = None) -> bool:
+    """True when this project's server accepts the flag.
+
+    A deliverable must not carry a key or a flag the local server does not know: the
+    launcher would fail at startup. Feature names move between releases, so the server's
+    own source is the only reliable answer.
+    """
+    root = root or strata_root()
+    return flag in server_flags(root)
+
+
 def server_engine_name(root: Path | None = None) -> str:
     """The backend name serve/server.py accepts for the real engine.
 
@@ -178,6 +203,7 @@ def describe() -> dict[str, str]:
         "engine": engine_binary(root),
         "server": server_script(root),
         "server_engine": server_engine_name(root),
+        "server_flags": sorted(server_flags(root)),
         "venv": venv_python(root),
         "settings": str(settings_path()),
     }

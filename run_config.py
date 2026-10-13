@@ -3,8 +3,9 @@
 Deliverables, in the project's own format (the same pair setup.py writes for a model):
 
     max_run_<model>.json   a run config: the keys setup.py owns (exe, args, cwd, tokenizer,
-                           model_name, log, lib_dirs, port, gpu, host, api_key,
-                           turn_tail_check) with the winning engine arguments in "args"
+                           model_name, log, lib_dirs, port, gpu, host, api_key) with the
+                           winning engine arguments in "args", plus turn_tail_check only
+                           when this project's server has that flag
     max_run_<model>.sh     the launcher setup.py writes: serve/server.py with that config
     max_run_<model>.bat    the same launcher for a Windows install of Strata
 
@@ -31,6 +32,7 @@ from strata_env import (
     engine_binary,
     server_engine_name,
     server_script,
+    server_supports,
     strata_root,
     venv_python,
 )
@@ -155,6 +157,11 @@ def build_run_config(
 
     if port is not None:
         cfg["port"] = int(port)
+    # A key the local server does not read is not a default, it is a dead key: the
+    # launcher would pass a flag argparse rejects. turn_tail_check is one of these - it
+    # belongs to the older HyperCore server, and Strata's server has no such flag.
+    tail_flag = "--turn-tail-check"
+    tail_supported = server_supports(tail_flag, root)
     if hasattr(setup, "apply_server_defaults"):
         # The installer's own precedence: what this run asked for, then the model's config,
         # then the default. A key someone set by hand is never replaced.
@@ -165,17 +172,21 @@ def build_run_config(
                 if os.environ.get(env):
                     return os.environ[env]
             return fallback
-        fallback = {
+        fallback: dict[str, Any] = {
             "host": default("HOST", "0.0.0.0"),
             "api_key": default("API_KEY", "0000"),
             "port": int(default("PORT", "8081")),
-            "turn_tail_check": default("TURN_TAIL_CHECK", "1") not in ("0", "", "false"),
         }
+        if tail_supported:
+            fallback["turn_tail_check"] = default("TURN_TAIL_CHECK", "1") not in ("0", "", "false")
         for key, default in fallback.items():
             if cfg.get(key) is None:
                 cfg[key] = default
     cfg["port"] = int(cfg["port"])
-    cfg["turn_tail_check"] = bool(cfg["turn_tail_check"])
+    if tail_supported:
+        cfg["turn_tail_check"] = bool(cfg.get("turn_tail_check", False))
+    else:
+        cfg.pop("turn_tail_check", None)
     cfg.setdefault("gpu", 0)
 
     cfg["tuned_by"] = {
@@ -294,16 +305,17 @@ def _emit_pair(
          f"{root / 'HyperCore-Tune' / 'results' / f'max_run_{quant}.record.json'}"),
     )
     engine_name = server_engine_name(root)
+    tail_on = bool(cfg.get("turn_tail_check", False))
     sh = deliverable_dir / f"max_run_{quant}.sh"
     # "--engine" is the server's backend selector (mock | strata), not the binary path:
     # the binary the worker runs is the "exe" key in the config beside the script.
     sh.write_text(
-        launcher_text(js, engine_name, cfg["port"], open_browser, cfg["turn_tail_check"], note),
+        launcher_text(js, engine_name, cfg["port"], open_browser, tail_on, note),
         encoding="utf-8",
     )
     sh.chmod(0o755)
     (deliverable_dir / f"max_run_{quant}.bat").write_text(
-        launcher_bat(js, engine_name, cfg["port"], open_browser, cfg["turn_tail_check"], note),
+        launcher_bat(js, engine_name, cfg["port"], open_browser, tail_on, note),
         encoding="utf-8",
     )
     return sh, js

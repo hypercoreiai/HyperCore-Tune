@@ -51,7 +51,15 @@ STUB = HERE / "stub_engine.py"
 FAKE_ROOT = Path(tempfile.mkdtemp(prefix="hypercore-tune-fake-strata-"))
 (FAKE_ROOT / "serve").mkdir(parents=True, exist_ok=True)
 (FAKE_ROOT / "serve" / "server.py").write_text(
-    'ap.add_argument("--engine", choices=["mock", "strata"], default="mock")\n',
+    """# The flags the stand-in server accepts. Deliberately without --turn-tail-check:
+# that flag belongs to the older HyperCore server and Strata's does not have it.
+ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+ap.add_argument("--config", help="the run config")
+ap.add_argument("--host", default=None)
+ap.add_argument("--port", type=int, default=8095)
+ap.add_argument("--open", action="store_true")
+ap.add_argument("--api-key", default="")
+""",
     encoding="utf-8",
 )
 (FAKE_ROOT / "CMakeLists.txt").write_text("# stand-in for the real project\n", encoding="utf-8")
@@ -198,7 +206,7 @@ def test_the_sweep_runs_and_writes_both_deliverables():
     cfg = json.loads(js.read_text(encoding="utf-8"))
     # The deliverable is a run config the server can read, not a tuning dump.
     for key in ("exe", "args", "cwd", "tokenizer", "model_name", "log", "port",
-                "host", "api_key", "turn_tail_check"):
+                "host", "api_key"):
         assert key in cfg, f"run config missing {key}"
     assert "--serve" not in cfg["args"] and "--max-new" not in cfg["args"]
     assert cfg["args"].count("--max-context") == 1
@@ -346,7 +354,7 @@ def test_the_generated_launcher_is_the_project_startup_pair():
     assert f'"{FAKE_PYTHON}"' in lines[-1], "the launcher must use the project venv"
     assert f'"--config" "{cfg_path}"' in lines[-1]
     assert '"--port" "8090"' in lines[-1]
-    assert "--turn-tail-check" in lines[-1]
+    assert "--turn-tail-check" not in lines[-1], "the stand-in server has no such flag"
     subprocess.run(["bash", "-n", str(launcher)], check=True)
     assert os.access(launcher, os.X_OK)
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -356,6 +364,59 @@ def test_the_generated_launcher_is_the_project_startup_pair():
     # A Windows install of Strata gets the same launcher in .bat form.
     bat = (out / "max_run_q2_0.bat").read_text(encoding="utf-8")
     assert bat.startswith("@echo off") and "cd /d " in bat and '"--engine" "strata"' in bat
+
+
+def test_a_flag_the_local_server_does_not_have_is_left_out():
+    """turn_tail_check is not a Strata key: the deliverable must not carry it, and the
+    launcher must not pass a flag argparse would reject."""
+    from strata_env import server_flags, server_supports
+
+    assert "--turn-tail-check" not in server_flags(FAKE_ROOT)
+    assert not server_supports("--turn-tail-check", FAKE_ROOT)
+    assert server_supports("--open", FAKE_ROOT)
+
+    out = Path("/tmp/hc-optuna-no-tail")
+    code = main([
+        "--model", "q2_0", "--engine", str(STUB), "--strata-root", str(FAKE_ROOT),
+        "--pack", str(HERE / "fixtures"), "--native", str(HERE / "fixtures" / "tiny.gguf"),
+        "--prompt-tokens-file", str(HERE / "fixtures" / "prompt.json"),
+        "--deliverable-dir", str(out), "--results-dir", str(out / "results"),
+        "--max-workers", "8", "--trials", "2", "--seed", "3", "--gen",
+    ])
+    assert code == 0
+    cfg = json.loads((out / "max_run_q2_0.json").read_text(encoding="utf-8"))
+    assert "turn_tail_check" not in cfg, "a key the server cannot read is dead weight"
+    launcher_path = out / "max_run_q2_0.sh"
+    assert "--turn-tail-check" not in launcher_path.read_text(encoding="utf-8")
+    subprocess.run(["bash", "-n", str(launcher_path)], check=True)
+
+
+def test_a_flag_the_local_server_does_have_is_kept():
+    """The same code path on a server that does define the flag keeps it."""
+    root = Path(tempfile.mkdtemp(prefix="hc-tail-capable-"))
+    (root / "serve").mkdir(parents=True)
+    (root / "serve" / "server.py").write_text(
+        'ap.add_argument("--engine", choices=["mock", "strata"], default="mock")\n'
+        'ap.add_argument("--turn-tail-check", action="store_true")\n',
+        encoding="utf-8",
+    )
+    (root / "CMakeLists.txt").write_text("", encoding="utf-8")
+    strata_root.cache_clear()
+    try:
+        out = Path("/tmp/hc-optuna-tail-capable")
+        main([
+            "--model", "q2_0", "--engine", str(STUB), "--strata-root", str(root),
+            "--pack", str(HERE / "fixtures"), "--native", str(HERE / "fixtures" / "tiny.gguf"),
+            "--prompt-tokens-file", str(HERE / "fixtures" / "prompt.json"),
+            "--deliverable-dir", str(out), "--results-dir", str(out / "results"),
+            "--max-workers", "8", "--trials", "2", "--seed", "4", "--gen",
+        ])
+        cfg = json.loads((out / "max_run_q2_0.json").read_text(encoding="utf-8"))
+        assert cfg["turn_tail_check"] is True
+        assert "--turn-tail-check" in (out / "max_run_q2_0.sh").read_text(encoding="utf-8")
+    finally:
+        strata_root.cache_clear()
+        os.environ["STRATA_ROOT"] = str(FAKE_ROOT)
 
 
 def test_no_browser_leaves_open_out_of_the_launcher():
@@ -369,7 +430,6 @@ def test_no_browser_leaves_open_out_of_the_launcher():
     ])
     text = (out / "max_run_q2_0.sh").read_text()
     assert "--open" not in text
-    assert "--turn-tail-check" in text
 
 
 def test_the_run_config_keeps_what_the_model_config_already_has():
