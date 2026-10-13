@@ -1,5 +1,7 @@
 # HyperCore-Tune
 
+<p align="center"><img src="docs/media/HyperCore-Tune.jpeg" width="420" alt="HyperCore-Tune"></p>
+
 Bayesian (Optuna TPE) tuning of the Strata engine, as a standalone repository that
 attaches to a Strata checkout.
 
