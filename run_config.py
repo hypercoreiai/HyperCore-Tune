@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any
 
 from strata_env import (
+    REPO,
+    abs_path,
     engine_binary,
     server_engine_name,
     server_script,
@@ -38,12 +40,15 @@ from strata_env import (
 )
 
 # Flags that exist only because the sweep measures one request in one process. They are not
-# part of a production run config: the server owns the process, and the request length is
-# whatever the client asks for.
+# part of a production run config: the server owns the process, the request length is
+# whatever the client asks for, and --prompt-cache-tail is not a flag the default Strata
+# interface accepts. --spec-min-p (draft-floor) stays: Strata does accept that one.
 SWEEP_ONLY: tuple[tuple[str, int], ...] = (
     ("--serve", 0),
     ("--max-new", 1),
     ("--expert-profile-save-every", 1),
+    # Not a flag the default Strata server/run-config accepts.
+    ("--prompt-cache-tail", 0),
 )
 
 # Keys a file must have to be treated as a run config rather than a tuning record.
@@ -64,13 +69,29 @@ def _setup_module() -> Any | None:
 
 
 def _cuda_lib_dirs() -> list[str]:
-    """The CUDA bin/lib64 directories actually present, the way the run configs list them."""
+    """The CUDA bin/lib directories actually present, the way the run configs list them."""
     out: list[str] = []
+    seen: set[str] = set()
+
+    def add(bin_dir: Path, lib_dir: Path) -> None:
+        if not lib_dir.is_dir():
+            return
+        for p in (bin_dir, lib_dir):
+            s = str(p)
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+
     for cand in sorted(Path("/usr/local").glob("cuda*")):
-        lib = cand / "lib64"
-        if lib.is_dir():
-            out.append(str(cand / "bin"))
-            out.append(str(lib))
+        add(cand / "bin", cand / "lib64")
+    cuda_root = abs_path(os.environ.get("CUDA_PATH"))
+    if cuda_root is not None:
+        add(cuda_root / "bin", cuda_root / "lib" / "x64")
+        add(cuda_root / "bin", cuda_root / "lib64")
+    toolkit = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    if toolkit.is_dir():
+        for cand in sorted(toolkit.glob("v*")):
+            add(cand / "bin", cand / "lib" / "x64")
     return out
 
 
@@ -129,7 +150,7 @@ def build_run_config(
     root = strata_root()
 
     engine = str(record.get("engine") or engine_binary(root) or root / "engine" / "strata")
-    cfg["exe"] = engine
+    cfg["exe"] = str(abs_path(engine) or Path(engine).expanduser().resolve())
     cfg["args"] = clean_args(args)
     cfg["cwd"] = str(root)
 
@@ -138,10 +159,13 @@ def build_run_config(
     tokenizer = str(cfg.get("tokenizer") or "")
     beside_pack = Path(paths["pack"]) / "tokenizer" if paths.get("pack") else None
     if beside_pack is not None and (beside_pack.is_dir() or beside_pack.is_file()):
-        if tokenizer and Path(tokenizer) != beside_pack:
+        if tokenizer and Path(tokenizer).expanduser().resolve() != beside_pack.resolve():
             print(f"note: {tokenizer} is not beside the pack in use ({paths['pack']}); "
                   f"using {beside_pack}", file=sys.stderr)
-        tokenizer = str(beside_pack)
+        tokenizer = str(beside_pack.resolve())
+    elif tokenizer:
+        found = abs_path(tokenizer)
+        tokenizer = str(found) if found is not None else tokenizer
     if tokenizer:
         cfg["tokenizer"] = tokenizer
 
@@ -302,7 +326,7 @@ def _emit_pair(
          f"latency {cfg['tuned_by']['metrics'].get('latency_ms', 0):.1f} ms"),
         f"tuned on {cfg['tuned_by'].get('hardware_slug', 'unknown machine')}",
         ("the trial record is "
-         f"{root / 'HyperCore-Tune' / 'results' / f'max_run_{quant}.record.json'}"),
+         f"{REPO / 'results' / f'max_run_{quant}.record.json'}"),
     )
     engine_name = server_engine_name(root)
     tail_on = bool(cfg.get("turn_tail_check", False))

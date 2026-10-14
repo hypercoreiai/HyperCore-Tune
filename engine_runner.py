@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
+import queue
 import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,31 +120,42 @@ def run_config(
     boot_timeout: int = 300,
     run_timeout: int = 180,
     extra_env: dict[str, str] | None = None,
+    cwd: str | Path | None = None,
 ) -> Metrics:
     """Boot the engine with `args`, send one GEN request, return its metrics.
 
     A boot that never reaches "session is up", a process that exits, a request that produces
     no tokens, and a timeout are each recorded as their own status rather than as a crash:
-    the optimizer needs a value for every point it tried.
+    the optimizer needs a value for every point it tried. `engine` and `log_path` are
+    resolved against the current directory before the process starts, so a relative value
+    still works when `cwd` is the Strata root.
     """
+    engine = str(Path(engine).expanduser().resolve())
+    log_path = Path(log_path).expanduser().resolve()
     metrics = Metrics(log_path=str(log_path))
     t_start = time.monotonic()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")
 
     env = dict(extra_env or {})
+    cmd = [engine] + args
+    # A .py stand-in is launched with this interpreter: Windows cannot exec a shebang.
+    if engine.lower().endswith(".py"):
+        cmd = [sys.executable, engine] + args
+    popen_kw: dict[str, Any] = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "bufsize": 0,
+        "env": env or None,
+    }
+    if cwd is not None:
+        popen_kw["cwd"] = str(Path(cwd).expanduser().resolve())
     try:
         # Binary pipes on purpose. bufsize=0 gives an unbuffered raw handle for stdin, so
         # there is no TextIOWrapper whose flush-at-GC can raise BrokenPipeError after the
         # engine has exited - the "Exception ignored while finalizing file" noise.
-        proc = subprocess.Popen(
-            [engine] + args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-            env=env or None,
-        )
+        proc = subprocess.Popen(cmd, **popen_kw)
     except OSError as exc:
         metrics.status = "FAIL_EXEC"
         metrics.note = f"could not start {engine}: {exc}"
@@ -160,13 +173,29 @@ def run_config(
             return False
         try:
             raw_in.write(line.encode("utf-8"))
+            raw_in.flush()
             return True
         except (BrokenPipeError, OSError, ValueError):
             return False
 
+    # A reader thread, not select(): Windows select() only accepts sockets, not pipes.
     fd = raw_out.fileno()
-    sel = selectors.DefaultSelector()
-    sel.register(fd, selectors.EVENT_READ)
+    chunks: queue.Queue[bytes | None] = queue.Queue()
+
+    def reader() -> None:
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.put(chunk)
+        except OSError:
+            pass
+        finally:
+            chunks.put(None)
+
+    thread = threading.Thread(target=reader, name="engine-stdout", daemon=True)
+    thread.start()
     pending = b""
     lines: list[str] = []
     done: dict[str, Any] | None = None
@@ -187,18 +216,13 @@ def run_config(
 
     try:
         while time.monotonic() < run_deadline and not eof:
-            # Read the raw fd, never a buffered wrapper: a buffered reader can hold data
-            # that select() cannot see, and the two together deadlock.
-            if not sel.select(timeout=0.5):
+            try:
+                chunk = chunks.get(timeout=0.5)
+            except queue.Empty:
                 if not sent and time.monotonic() > boot_deadline:
                     break
                 continue
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError:
-                eof = True
-                break
-            if not chunk:
+            if chunk is None:
                 eof = True
                 break
             pending += chunk
@@ -212,7 +236,6 @@ def run_config(
     except (BrokenPipeError, ValueError) as exc:
         metrics.note = f"the engine closed its output: {exc}"
     finally:
-        sel.close()
         # QUIT only while the engine is alive; a dead engine's stdin raises EPIPE.
         if proc.poll() is None:
             send("QUIT\n")
@@ -230,6 +253,7 @@ def run_config(
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+        thread.join(timeout=1)
 
     log_text = "\n".join(lines)
     log_path.write_text(log_text, encoding="utf-8")

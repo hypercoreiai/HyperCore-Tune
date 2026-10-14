@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """HyperCore-Tune/bayesian_tune.py - Bayesian (TPE) tuning of the Strata engine.
 
-Searches the ten dimensions the brief names - vram, pcie, ple-io, kv, kvgrow, hostcore,
-affinity, worker, tail - against one of three user-selected objectives:
+Searches the dimensions the brief names - vram, pcie, ple-io, kv, kvgrow, hostcore,
+affinity, worker, tail, draft-floor - against one of three user-selected objectives:
 
     --prefill   maximise prompt tokens/s
     --gen       maximise generated tokens/s
@@ -25,8 +25,9 @@ model, objective and context:
     <CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
 
 A sweep on the same machine loads it, never re-boots a configuration it has already
-measured, and seeds the TPE sampler with those trials. --no-load starts cold; a record
-from different hardware is ignored unless --allow-hardware-mismatch is given.
+measured, seeds the TPE sampler with those trials, and keeps drawing until --trials
+unseen configurations have been evaluated. --no-load starts cold; a record from
+different hardware is ignored unless --allow-hardware-mismatch is given.
 
 Run it through the project venv:  ./HyperCore-Tune/max_tune.sh --model q2_0 --gen --cntx 131072
 The Strata root is found from this repository's location, or pinned with --strata-root.
@@ -74,7 +75,7 @@ from search_space import (
     sample,
     signature,
 )
-from strata_env import engine_binary, strata_root
+from strata_env import abs_path, engine_binary, strata_root
 
 OBJECTIVES = ("gen", "prefill", "latency")
 PENALTY = {"gen": 0.0, "prefill": 0.0, "latency": -1e9}  # every score is "higher is better"
@@ -93,6 +94,41 @@ def signed_score(m: Metrics, objective: str) -> float:
     if objective == "prefill":
         return m.prefill_tok_s
     return -m.latency_ms
+
+
+def _cfg_matches_frozen(cfg: dict[str, Any], frozen: dict[str, object]) -> bool:
+    """True when every pinned dimension already has the value this sweep is holding."""
+    return all(str(cfg.get(key)) == str(value) for key, value in frozen.items())
+
+
+def frozen_from_args(args: argparse.Namespace) -> dict[str, object]:
+    """Dimensions the operator pinned to a constant, keyed as in the search space."""
+    frozen: dict[str, object] = {}
+    if getattr(args, "pcie", None) is not None:
+        frozen["pcie"] = float(args.pcie)
+    if getattr(args, "ple_io", None) is not None:
+        frozen["ple_io"] = str(args.ple_io)
+    if getattr(args, "kv", None) is not None:
+        frozen["kv"] = str(args.kv)
+    if getattr(args, "kvgrow", None) is not None:
+        frozen["kvgrow"] = str(args.kvgrow)
+    if getattr(args, "host_core", None) is not None:
+        frozen["host_core"] = str(args.host_core)
+    if getattr(args, "affinity", None) is not None:
+        frozen["affinity"] = str(args.affinity)
+    if getattr(args, "worker", None) is not None:
+        frozen["worker"] = int(args.worker)
+    if getattr(args, "tail", None) is not None:
+        frozen["tail"] = str(args.tail)
+    if getattr(args, "draft_floor", None) is not None:
+        frozen["draft_floor"] = float(args.draft_floor)
+    return frozen
+
+
+def draft_floor_of(args: argparse.Namespace) -> float:
+    """The pinned floor, or the pre-search default used to fill old records."""
+    value = getattr(args, "draft_floor", None)
+    return float(value) if value is not None else 0.8
 
 
 def make_sampler(name: str, seed: int) -> optuna.samplers.BaseSampler:
@@ -128,6 +164,7 @@ class TrialRow:
             "affinity": self.cfg["affinity"],
             "worker": self.cfg["worker"],
             "tail": self.cfg["tail"],
+            "draft_floor": self.cfg["draft_floor"],
             "status": m.status,
         }
         row.update({
@@ -168,6 +205,10 @@ class Sweeper:
         self.prior_rows: dict[tuple[object, ...], TrialRow] = {}
         self.best_row: TrialRow | None = None
         self.priors_skipped = 0
+        self.duplicates_skipped = 0
+        self.frozen: dict[str, object] = dict(getattr(args, "frozen", {}) or {})
+        if self.frozen:
+            self.priors = [p for p in priors if _cfg_matches_frozen(p.get("cfg", {}), self.frozen)]
         self.prompt_ids = build_prompt(args.prompt_tokens_file, args.prompt_tokens)
         self.model = args.model
         self._seed_from_history()
@@ -197,8 +238,8 @@ class Sweeper:
     def evaluate(self, layer: str, cfg: Config) -> TrialRow:
         sig = signature(cfg)
         if sig in self.seen:
-            # A duplicate point costs a full boot. Reuse the measurement we already have,
-            # which may come from a previous sweep on this machine.
+            # Safety net: the study loop skips seen points before calling evaluate.
+            # Reuse the measurement we already have rather than boot again.
             prior = self.prior_rows.get(sig) or self.best_row
             if prior is None:
                 row = TrialRow(layer, cfg, Metrics(status="DUPLICATE"),
@@ -213,7 +254,7 @@ class Sweeper:
         self.seen.add(sig)
 
         args = engine_args(cfg, self.paths.as_dict(), self.args.cntx,
-                           self.args.max_new, self.args.spec_min_p)
+                           self.args.max_new, draft_floor_of(self.args))
         if self.args.dry_run:
             m = Metrics(status="DRY")
             m.note = " ".join(args)
@@ -230,6 +271,7 @@ class Sweeper:
                 engine=self.args.engine, args=args, prompt_ids=self.prompt_ids,
                 max_new=self.args.max_new, log_path=log,
                 boot_timeout=self.args.boot_timeout, run_timeout=self.args.run_timeout,
+                cwd=self.root,
             ))
         # Median of the repeats: one boot is noisy enough to flip a ranking.
         best = max(runs, key=lambda m: signed_score(m, self.args.objective))
@@ -246,7 +288,8 @@ class Sweeper:
         print(f"  trial {len(self.rows):>3} layer={layer} "
               f"vram={cfg['vram']} pcie={cfg['pcie']} ple-io={cfg['ple_io']} kv={cfg['kv']} "
               f"kvgrow={cfg['kvgrow']} hostcore={cfg['host_core']} affinity={cfg['affinity']} "
-              f"worker={cfg['worker']} tail={cfg['tail']} -> {m.status} "
+              f"worker={cfg['worker']} tail={cfg['tail']} "
+              f"draft-floor={cfg['draft_floor']} -> {m.status} "
               f"gen {m.gen_tok_s:.2f} tok/s prefill {m.prefill_tok_s:.2f} tok/s "
               f"latency {m.latency_ms:.0f} ms" + (f"  [{m.note}]" if m.note else ""))
         sys.stdout.flush()
@@ -254,52 +297,91 @@ class Sweeper:
 
     # ---- the study -------------------------------------------------------------
     def run(self) -> bool:
-        """Run the study. Returns False if it was interrupted by Ctrl-C."""
+        """Run the study. Returns True if it was interrupted by Ctrl-C."""
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         sampler = make_sampler(self.args.sampler, self.args.seed)
-        interrupted = False
 
         if self.args.mode == "joint":
             study = optuna.create_study(direction="maximize", sampler=sampler)
             self._warm_study(study, self.params)
-            frozen: dict[str, object] = {}
-
-            def objective(trial) -> float:
-                cfg = sample(trial, self.params, frozen)
-                incumbent = self.best_row.cfg if self.best_row else {}
-                changed = sorted({p.layer for p in self.params
-                                 if p.key in cfg and cfg[p.key] != incumbent.get(p.key, cfg[p.key])})
-                layer = "joint" if not self.best_row else (",".join(changed) or "joint")
-                return self.evaluate(layer, cfg).score
-
-            try:
-                study.optimize(objective, n_trials=self.args.trials, show_progress_bar=False)
-            except KeyboardInterrupt:
-                interrupted = True
+            interrupted = self._run_study(study, self.params, dict(self.frozen), self.args.trials)
+            if interrupted:
                 print("\ninterrupted: keeping the best configuration measured so far")
-        else:
-            frozen = {}
-            for layer in self.layers():
-                layer_params = [p for p in self.params if p.layer == layer]
-                if not layer_params:
-                    continue
-                study = optuna.create_study(direction="maximize",
-                                          sampler=make_sampler(self.args.sampler, self.args.seed))
-                self._warm_study(study, layer_params)
+            return interrupted
 
-                try:
-                    study.optimize(self._layer_objective(layer, layer_params, frozen),
-                                   n_trials=self.args.trials_per_layer,
-                                   show_progress_bar=False)
-                except KeyboardInterrupt:
-                    interrupted = True
-                    print(f"\ninterrupted during layer {layer}; keeping what has been measured")
-                    break
-                if study.best_trial is not None and study.best_trial.value > PENALTY[self.args.objective]:
-                    for p in layer_params:
-                        frozen[p.key] = study.best_trial.params[p.key]
-                    print(f"--- layer {layer}: locked {frozen} at {study.best_trial.value:.4f}")
-        return interrupted
+        frozen: dict[str, object] = dict(self.frozen)
+        for layer in self.layers():
+            layer_params = [p for p in self.params if p.layer == layer]
+            if not layer_params:
+                continue
+            study = optuna.create_study(direction="maximize",
+                                      sampler=make_sampler(self.args.sampler, self.args.seed))
+            self._warm_study(study, layer_params)
+            interrupted = self._run_study(
+                study, layer_params, frozen, self.args.trials_per_layer, layer_hint=layer)
+            if interrupted:
+                print(f"\ninterrupted during layer {layer}; keeping what has been measured")
+                return True
+            if study.best_trial is not None and study.best_trial.value > PENALTY[self.args.objective]:
+                for p in layer_params:
+                    frozen[p.key] = study.best_trial.params[p.key]
+                print(f"--- layer {layer}: locked {frozen} at {study.best_trial.value:.4f}")
+        return False
+
+    def _run_study(
+        self,
+        study: optuna.Study,
+        params: list[Param],
+        frozen: dict[str, object],
+        n_trials: int,
+        layer_hint: str | None = None,
+    ) -> bool:
+        """Ask Optuna until `n_trials` unseen configurations have been evaluated.
+
+        A suggestion already in history (or already tried this sweep) is pruned, not
+        scored, so it does not consume the --trials budget and does not double-count
+        in TPE. Returns True if the operator hit Ctrl-C.
+        """
+        new = 0
+        asks = 0
+        streak = 0
+        max_asks = max(n_trials * 50, n_trials + 32)
+        try:
+            while new < n_trials and asks < max_asks:
+                trial = study.ask()
+                asks += 1
+                cfg = sample(trial, params, frozen)
+                if signature(cfg) in self.seen:
+                    study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                    self.duplicates_skipped += 1
+                    streak += 1
+                    if streak >= 32:
+                        print(f"note: Optuna suggested {streak} already-measured "
+                              f"configurations in a row; stopping with {new} new trials",
+                              file=sys.stderr)
+                        break
+                    continue
+                streak = 0
+                study.tell(trial, self._score_cfg(cfg, params, layer_hint))
+                new += 1
+        except KeyboardInterrupt:
+            return True
+        if new < n_trials and streak < 32:
+            print(f"note: reached the redraw limit with {new} of {n_trials} new trials "
+                  f"({self.duplicates_skipped} duplicate suggestions skipped)",
+                  file=sys.stderr)
+        return False
+
+    def _score_cfg(self, cfg: Config, params: list[Param], layer_hint: str | None) -> float:
+        """Evaluate one unseen configuration and return its Optuna score."""
+        if layer_hint:
+            layer = layer_hint
+        else:
+            incumbent = self.best_row.cfg if self.best_row else {}
+            changed = sorted({p.layer for p in params
+                             if p.key in cfg and cfg[p.key] != incumbent.get(p.key, cfg[p.key])})
+            layer = "joint" if not self.best_row else (",".join(changed) or "joint")
+        return self.evaluate(layer, cfg).score
 
     def expected_trials(self) -> int:
         if self.args.mode == "joint":
@@ -309,14 +391,6 @@ class Sweeper:
     def layers(self) -> Sequence[str]:
         wanted = self.args.layers or LAYERS
         return [l for l in wanted if l in LAYERS]
-
-    def _layer_objective(self, layer: str, layer_params: list[Param],
-                        frozen: dict[str, object]):
-        """A closure that binds the layer and its parameters for one study."""
-        def objective(trial) -> float:
-            cfg = sample(trial, layer_params, frozen)
-            return self.evaluate(layer, cfg).score
-        return objective
 
     def _warm_study(self, study, params: list[Param]) -> int:
         """Hand the study the configurations already measured on this machine.
@@ -366,7 +440,7 @@ class Sweeper:
         if not self.best_row:
             return []
         return engine_args(self.best_row.cfg, self.paths.as_dict(), self.args.cntx,
-                           self.args.max_new, self.args.spec_min_p)
+                           self.args.max_new, draft_floor_of(self.args))
 
     def record(self, csv_path: Path) -> dict[str, Any]:
         best = self.best_row
@@ -382,7 +456,7 @@ class Sweeper:
             "objective": self.args.objective,
             "context": self.args.cntx,
             "max_new": self.args.max_new,
-            "spec_min_p": self.args.spec_min_p,
+            "spec_min_p": (best.cfg.get("draft_floor") if best else None) or draft_floor_of(self.args),
             "best": dict(best.cfg) if best else {},
             "metrics": {
                 "gen_tok_s": best.metrics.gen_tok_s if best else 0.0,
@@ -418,6 +492,7 @@ class Sweeper:
                 "trials_loaded": len(self.priors),
                 "priors_skipped": self.priors_skipped,
                 "reused": sum(1 for r in self.rows if r.from_history),
+                "duplicates_skipped": self.duplicates_skipped,
             },
             "trials": [r.to_dict() for r in self.rows],
             "csv": str(csv_path),
@@ -445,7 +520,7 @@ class Sweeper:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Bayesian (Optuna) tuning of the HyperCore engine.",
+        description="Bayesian (Optuna) tuning of the Strata engine.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model", default="q2_0", help="quant name; names the deliverables")
@@ -460,7 +535,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="same as the metric flag above; the flag wins")
     p.add_argument("--cntx", "--context", type=int, default=131072, dest="cntx",
                    help="context length the sweep is tuned at")
-    p.add_argument("--trials", type=int, default=40, help="configurations to evaluate")
+    p.add_argument("--trials", type=int, default=40,
+                   help="unseen configurations to evaluate; repeats of a point already "
+                        "in history are redrawn and do not count")
     p.add_argument("--mode", choices=("joint", "staged"), default="joint")
     p.add_argument("--layers", default=None, help="comma separated layers for staged mode")
     p.add_argument("--sampler", choices=("tpe", "gp", "random"), default="tpe")
@@ -470,11 +547,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--prompt-tokens", type=int, default=10240,
                    help="prompt length; >8192 is needed for the tail arm to differ")
     p.add_argument("--prompt-tokens-file", default=None, help="file of token ids to cycle")
-    p.add_argument("--spec-min-p", type=float, default=0.8, help="speculative draft floor")
     p.add_argument("--vram-min", type=int, default=256)
     p.add_argument("--vram-max", type=int, default=1536)
     p.add_argument("--vram-step", type=int, default=256)
     p.add_argument("--max-workers", type=int, default=None, help="cap the pool-workers grid")
+    p.add_argument("--pcie", type=float, default=None,
+                   help="hold --pcie-frac at this value instead of searching it")
+    p.add_argument("--ple-io", default=None, choices=("direct", "mmap", "ram"), dest="ple_io",
+                   help="hold --ple-io at this value instead of searching it")
+    p.add_argument("--kv", default=None, choices=("q4_0", "k8v4", "int8", "fp16"),
+                   help="hold --kv at this value instead of searching it")
+    p.add_argument("--kvgrow", default=None, choices=("0", "1"),
+                   help="hold --kv-grow at 0 or 1 instead of searching it")
+    p.add_argument("--hostcore", "--host-core", default=None, choices=("first", "last"),
+                   dest="host_core",
+                   help="hold --host-core at this value instead of searching it")
+    p.add_argument("--affinity", default=None, choices=("all", "p-cores", "auto"),
+                   help="hold --pool-affinity at this value instead of searching it")
+    p.add_argument("--worker", type=int, default=None,
+                   help="hold --pool-workers at this value instead of searching it")
+    p.add_argument("--tail", default=None, choices=("0", "1"),
+                   help="hold --prompt-cache-tail at 0 or 1 during the sweep; "
+                        "the flag is never written into the deliverable")
+    p.add_argument("--draft-floor", "--spec-min-p", type=float, default=None,
+                   dest="draft_floor",
+                   help="hold --spec-min-p at this value (0.001-1) instead of searching it")
     p.add_argument("--engine", default=None,
                    help="the engine binary to boot; default the one this project built "
                         "(engine/strata, engine/hypercore, build/...)")
@@ -520,12 +617,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="the generated launcher leaves out --open")
     args = p.parse_args(argv)
     if args.strata_root:
-        os.environ["STRATA_ROOT"] = str(Path(args.strata_root).expanduser().resolve())
+        pinned = abs_path(args.strata_root)
+        os.environ["STRATA_ROOT"] = str(pinned) if pinned is not None else args.strata_root
         strata_root.cache_clear()
+    for name in ("engine", "pack", "native", "ple_gguf", "mtp", "data_dir",
+                 "prompt_tokens_file", "results_dir", "history_dir", "replay",
+                 "history_file", "deliverable_dir"):
+        value = getattr(args, name)
+        if value:
+            resolved = abs_path(value)
+            setattr(args, name, str(resolved) if resolved is not None else value)
+    if args.hardware:
+        hw_path = Path(args.hardware).expanduser()
+        if hw_path.is_file():
+            args.hardware = str(hw_path.resolve())
     root = strata_root()
     args.root = root
     if not args.engine:
-        args.engine = engine_binary(root) or str(root / "engine" / "strata")
+        fallback = root / "engine" / ("strata.exe" if os.name == "nt" else "strata")
+        args.engine = engine_binary(root) or str(fallback)
+    args.engine = str(abs_path(args.engine) or Path(args.engine).expanduser().resolve())
     if not args.objective:
         args.objective = "gen"
     args.layers = [x.strip() for x in args.layers.split(",")] if args.layers else list(LAYERS)
@@ -535,6 +646,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.trials < 1:
         p.error("--trials must be at least 1")
     args.trials_per_layer = max(2, args.trials // max(1, len(args.layers)))
+    args.frozen = frozen_from_args(args)
     return args
 
 
@@ -591,6 +703,8 @@ def best_from_records(results_dir: Path, model: str, objective: str) -> TrialRow
                     "affinity": raw["affinity"],
                     "worker": int(raw["worker"]),
                     "tail": raw["tail"],
+                    "draft_floor": float(raw["draft_floor"] if raw.get("draft_floor") is not None
+                                         else raw.get("spec_min_p") or 0.8),
                 }
             except (KeyError, ValueError, TypeError):
                 continue
@@ -610,7 +724,7 @@ def rebuild_from_records(args: argparse.Namespace, paths: ModelPaths, hw: Hardwa
             f"HyperCore-Tune: no measured (status PASS) trial for model {args.model} "
             f"objective {args.objective} in {args.results_dir}"
         )
-    engine = engine_args(row.cfg, paths.as_dict(), args.cntx, args.max_new, args.spec_min_p)
+    engine = engine_args(row.cfg, paths.as_dict(), args.cntx, args.max_new, draft_floor_of(args))
     record = {
         "schema": "hypercore.max_run/1",
         "model": args.model,
@@ -621,7 +735,7 @@ def rebuild_from_records(args: argparse.Namespace, paths: ModelPaths, hw: Hardwa
         "objective": args.objective,
         "context": args.cntx,
         "max_new": args.max_new,
-        "spec_min_p": args.spec_min_p,
+        "spec_min_p": row.cfg.get("draft_floor", draft_floor_of(args)),
         "best": dict(row.cfg),
         "metrics": {
             "gen_tok_s": row.metrics.gen_tok_s,
@@ -719,6 +833,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     params = build_space(vram_low=args.vram_min, vram_high=args.vram_max, vram_step=args.vram_step,
                         max_workers=args.max_workers)
+    frozen = dict(args.frozen)
+    for p in params:
+        if p.key not in frozen:
+            continue
+        value = frozen[p.key]
+        if p.kind == "choice" and str(value) not in {str(c) for c in p.choices}:
+            raise SystemExit(f"HyperCore-Tune: frozen {p.key}={value!r} is not one of {p.choices}")
+        if p.kind == "int" and not (int(p.low) <= int(value) <= int(p.high)):
+            raise SystemExit(
+                f"HyperCore-Tune: frozen {p.key}={value} is outside [{int(p.low)}, {int(p.high)}]")
+        if p.kind == "float" and not (float(p.low) <= float(value) <= float(p.high)):
+            raise SystemExit(
+                f"HyperCore-Tune: frozen {p.key}={value} is outside [{p.low}, {p.high}]")
+    params = [p for p in params if p.key not in frozen]
+    if not params:
+        raise SystemExit("HyperCore-Tune: every dimension is frozen; nothing to search")
 
     hw = _hardware(args.hardware)
     history_file = Path(args.history_file) if args.history_file else history_path(
@@ -741,7 +871,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for source in sources:
             record = load_history(source)
             if record:
-                priors.extend(usable_trials(record, args.max_new, args.spec_min_p))
+                fill = record.get("spec_min_p")
+                priors.extend(usable_trials(
+                    record, args.max_new, 0.8 if fill is None else float(fill)))
         if priors:
             print(f"history: {len(priors)} configurations from "
                   f"{', '.join(str(s) for s in sources)}")
@@ -755,6 +887,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"machine: {hw.slug()}")
     print(f"engine: {args.engine}")
     print(f"pack:   {paths.pack}")
+    if frozen:
+        print("frozen: " + ", ".join(f"{k}={v}" for k, v in frozen.items()))
 
     sweeper = Sweeper(args, root, params, paths, hw, priors)
     t0 = time.monotonic()
@@ -770,7 +904,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"record: {record_path}")
     hist_path = save_history(history_file, record)
     print(f"history: {hist_path} ({record['history']['trials_loaded']} priors loaded, "
-          f"{record['history']['reused']} configurations reused)")
+          f"{record['history']['reused']} configurations reused, "
+          f"{record['history']['duplicates_skipped']} duplicate suggestions skipped)")
 
     if not args.no_deliverables:
         if not sweeper.best_row:

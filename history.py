@@ -6,11 +6,15 @@ One file per (machine, model, objective, context):
 
 The file is a merge of every sweep that ran on that machine: the trials it measured,
 deduplicated by configuration signature, plus a short list of the runs that produced
-them. Loading it does two things:
+them. Loading it does three things:
 
   1. the configurations already measured on this machine are not booted again;
   2. they are added to the Optuna study as completed trials, so TPE starts from them
-     instead of from a cold prior.
+     instead of from a cold prior;
+  3. a suggestion that matches one of them is redrawn, so --trials means new points.
+
+draft_floor is part of the configuration signature. Older records that stored it only as
+the run-level spec_min_p still load: the missing key is filled from that field.
 
 A record from a different CPU, GPU, RAM or PCIe generation is not loaded unless
 --allow-hardware-mismatch is passed, because a pcie-frac or pool-workers winner on one
@@ -31,6 +35,7 @@ from search_space import Config, Param, signature
 SCHEMA = "hypercore.tuning_history/1"
 CFG_KEYS: tuple[str, ...] = (
     "vram", "pcie", "ple_io", "kv", "kvgrow", "host_core", "affinity", "worker", "tail",
+    "draft_floor",
 )
 
 
@@ -82,6 +87,10 @@ def normalise_trial(row: dict[str, Any], max_new: int, spec_min_p: float) -> dic
     cfg: Config = {}
     for key in CFG_KEYS:
         if key not in cfg_raw:
+            # Pre-draft_floor records stored the floor on the run, not the trial.
+            if key == "draft_floor":
+                cfg[key] = float(row.get("spec_min_p", spec_min_p))
+                continue
             return None
         cfg[key] = cfg_raw[key]
     try:
@@ -110,8 +119,9 @@ def usable_trials(record: dict[str, Any], max_new: int, spec_min_p: float) -> li
     """Trials whose request shape matches the sweep about to run.
 
     Metrics only compare against each other when the prompt and the generation length are
-    the same, so a trial measured with a different --max-new or --spec-min-p is dropped
-    rather than silently mixed in.
+    the same, so a trial measured with a different --max-new is dropped rather than
+    silently mixed in. --spec-min-p is a searched dimension (draft_floor); it lives on
+    the configuration signature instead of filtering the whole record.
     """
     out: list[dict[str, Any]] = []
     for row in record.get("trials", []):
@@ -120,7 +130,7 @@ def usable_trials(record: dict[str, Any], max_new: int, spec_min_p: float) -> li
         trial = normalise_trial(row, max_new, spec_min_p)
         if trial is None:
             continue
-        if trial["max_new"] != int(max_new) or abs(trial["spec_min_p"] - float(spec_min_p)) > 1e-9:
+        if trial["max_new"] != int(max_new):
             continue
         out.append(trial)
     return out
@@ -142,7 +152,8 @@ def merge(existing: dict[str, Any] | None, record: dict[str, Any]) -> dict[str, 
         tuple(t["signature"]): t for t in base.get("trials", []) if isinstance(t, dict)
     }
     for row in record.get("trials", []):
-        trial = normalise_trial(row, record.get("max_new", 0), record.get("spec_min_p", 0.0))
+        fill = record.get("spec_min_p")
+        trial = normalise_trial(row, record.get("max_new", 0), 0.8 if fill is None else float(fill))
         if trial is None:
             continue
         key = tuple(trial["signature"])

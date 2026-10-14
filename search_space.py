@@ -2,12 +2,16 @@
 
 Every trial writes one row with exactly the columns the brief asks for:
 
-    layer  vram  pcie  ple-io  kv  kvgrow  hostcore  affinity  worker  tail  status
+    layer  vram  pcie  ple-io  kv  kvgrow  hostcore  affinity  worker  tail  draft_floor  status
 
 `layer` is the group a trial is perturbing. In staged mode it is the layer the study is
 currently frozen on; in joint mode it is the group whose value differs from the incumbent
 best ("joint" for the first trial, which has no incumbent). `status` is not a parameter:
 it is what the engine did with the configuration (PASS, FAIL_BOOT, NO_TOKENS, TIMEOUT).
+
+A freeze overlay (sample(..., frozen)) holds pinned dimensions at a constant. tail writes
+--prompt-cache-tail during the sweep; that flag is stripped from the deliverable.
+draft-floor writes --spec-min-p, which stays in the production args.
 
 Determinism: every parameter is sampled from a closed grid, so a trial's configuration is
 reproducible from (seed, trial index) and the signature of a configuration is a plain
@@ -22,6 +26,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from strata_env import abs_path, settings_path
+
 try:  # psutil is in .venv (requirements.txt); the fallback keeps this importable anywhere.
     import psutil
 except ImportError:  # pragma: no cover - only hit on a bare interpreter
@@ -29,12 +35,13 @@ except ImportError:  # pragma: no cover - only hit on a bare interpreter
 
 LAYERS: tuple[str, ...] = (
     "topology", "ple-io", "kv", "kv-grow", "host-core", "affinity", "worker", "tail",
+    "draft-floor",
 )
 
 # Column order of the CSV, exactly as specified in the brief.
 ROW_COLUMNS: tuple[str, ...] = (
     "layer", "vram", "pcie", "ple_io", "kv", "kvgrow", "hostcore",
-    "affinity", "worker", "tail", "status",
+    "affinity", "worker", "tail", "draft_floor", "status",
 )
 
 Config = dict[str, object]
@@ -93,7 +100,7 @@ def build_space(
     kv_modes: Sequence[str] = ("q4_0", "k8v4", "int8", "fp16"),
     ple_modes: Sequence[str] = ("direct", "mmap", "ram"),
 ) -> list[Param]:
-    """The ten dimensions of the sweep, with the ranges the engine accepts.
+    """The dimensions of the sweep, with the ranges the engine accepts.
 
     --pool-workers 0 is not "no workers": it means "every physical core except the host"
     (src/program/generate.cpp:409), so 0 is a legitimate arm and the grid is capped at the
@@ -113,8 +120,10 @@ def build_space(
         Param("affinity", "affinity", "choice", "--pool-affinity", "value",
              choices=("all", "p-cores", "auto")),
         Param("worker", "worker", "int", "--pool-workers", "value",
-             low=0, high=max(0, cores - 1), step=1),
+              low=0, high=max(0, cores - 1), step=1),
         Param("tail", "tail", "choice", "--prompt-cache-tail", "on", choices=("0", "1")),
+        Param("draft_floor", "draft-floor", "float", "--spec-min-p", "value",
+              low=0.001, high=1.0, step=0.001),
     ]
 
 
@@ -128,6 +137,7 @@ DEFAULT_CONFIG: Config = {
     "affinity": "all",
     "worker": 0,
     "tail": "0",
+    "draft_floor": 0.8,
 }
 
 
@@ -139,9 +149,9 @@ def signature(cfg: Config) -> tuple[object, ...]:
 def sample(trial, params: Sequence[Param], frozen: dict[str, object]) -> Config:
     """Ask Optuna for one point in the space, leaving `frozen` dimensions untouched."""
     cfg: Config = dict(DEFAULT_CONFIG)
+    cfg.update(frozen)
     for p in params:
         if p.key in frozen:
-            cfg[p.key] = frozen[p.key]
             continue
         if p.kind == "choice":
             cfg[p.key] = trial.suggest_categorical(p.key, list(p.choices))
@@ -157,13 +167,16 @@ def engine_args(
     paths: dict[str, str],
     context: int,
     max_new: int,
-    spec_min_p: float = 0.8,
+    spec_min_p: float | None = 0.8,
 ) -> list[str]:
     """The engine command line for one configuration.
 
     The base block is the production one (the same flags tune/max_tune.sh boots every
     arm with); only the swept dimensions come from cfg.
     """
+    cfg = dict(cfg)
+    if cfg.get("draft_floor") is None:
+        cfg["draft_floor"] = 0.8 if spec_min_p is None else spec_min_p
     args: list[str] = ["--serve"]
     for key, flag in (("pack", "--pack"), ("native", "--native"), ("ple_gguf", "--ple-gguf")):
         if paths.get(key):
@@ -178,8 +191,7 @@ def engine_args(
                 "--cvec-dir", "per-layer"]
     args += ["--prefill", "auto", "--spec", "4", "--expert-cache", "auto",
             "--max-context", str(context), "--max-new", str(max_new),
-            "--spec-min-p", str(spec_min_p), "--mmap-experts",
-            "--expert-profile-save-every", "0"]
+            "--mmap-experts", "--expert-profile-save-every", "0"]
 
     for p in build_space():
         value = cfg.get(p.key)
@@ -221,19 +233,19 @@ DATA_ITEMS: tuple[str, ...] = ("models", "packs", "mtp")
 def settings_data_dir() -> str:
     """The data folder the installer remembered in the user's settings, or "".
 
-    Mirrors setup.py: `~/.config/strata/settings.json` (or `$XDG_CONFIG_HOME`), falling
-    back to the older `hypercore` folder. A missing or unreadable file is not an error, it
-    just means no remembered folder.
+    Mirrors setup.py: `~/.config/strata/settings.json` (or `$XDG_CONFIG_HOME`), and on
+    Windows `%APPDATA%\\strata\\settings.json`. The older `hypercore` folder is a fallback.
+    A missing or unreadable file is not an error, it just means no remembered folder.
     """
-    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    for name in ("strata", "hypercore"):
-        path = base / name / "settings.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and data.get("data_dir"):
-            return str(data["data_dir"])
+    path = settings_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if isinstance(data, dict) and data.get("data_dir"):
+        found = abs_path(data["data_dir"])
+        if found is not None:
+            return str(found)
     return ""
 
 
@@ -249,6 +261,7 @@ def data_roots(root: Path) -> tuple[str, ...]:
     pinned = [os.environ.get("STRATA_DATA", ""), os.environ.get("HYPERCORE_DATA", ""),
               settings_data_dir()]
     discovered: list[str] = []
+    root = abs_path(root) or Path(root).resolve()
     for base in dict.fromkeys((root.parent, root.parent.parent)):
         try:
             entries = list(base.iterdir())
@@ -258,7 +271,7 @@ def data_roots(root: Path) -> tuple[str, ...]:
             name = d.name.lower()
             if d.is_dir() and (name.startswith(("strata-data", "hypercore-data"))
                                or name.endswith("-data")):
-                discovered.append(str(d))
+                discovered.append(str(d.resolve()))
     home = str(Path.home())
     discovered.sort(key=lambda r: (not r.startswith(home), r))
 
@@ -266,8 +279,8 @@ def data_roots(root: Path) -> tuple[str, ...]:
     for raw in pinned + discovered:
         if not raw:
             continue
-        p = Path(raw)
-        if not p.is_dir() or not any((p / item).is_dir() for item in DATA_ITEMS):
+        p = abs_path(raw)
+        if p is None or not p.is_dir() or not any((p / item).is_dir() for item in DATA_ITEMS):
             continue
         if str(p) not in ordered:
             ordered.append(str(p))
@@ -285,7 +298,9 @@ def resolve_model_paths(root: Path, model: str, data_dir: str | None = None) -> 
     """
     quant = model.lower()
     model_dir = quant.upper()
-    candidates = [str(root)] + ([data_dir] if data_dir else []) + list(data_roots(root))
+    root = abs_path(root) or Path(root).resolve()
+    extra = abs_path(data_dir)
+    candidates = [str(root)] + ([str(extra)] if extra is not None else []) + list(data_roots(root))
     found: list[ModelPaths] = []
 
     for base in candidates:
@@ -295,7 +310,7 @@ def resolve_model_paths(root: Path, model: str, data_dir: str | None = None) -> 
         paths = ModelPaths()
         for cand in (b / "packs" / quant, b / "packs" / model_dir, b / quant):
             if (cand / "experts.bin").exists() or (cand / "dense.bin").exists():
-                paths.pack = str(cand)
+                paths.pack = str(cand.resolve())
                 break
         ggufs: list[Path] = []
         for sub in (b / "models" / model_dir, b / model_dir):
@@ -304,23 +319,23 @@ def resolve_model_paths(root: Path, model: str, data_dir: str | None = None) -> 
                 if ggufs:
                     break
         if ggufs:
-            paths.native = str(ggufs[0])
+            paths.native = str(ggufs[0].resolve())
             rest = [g for g in ggufs if "of-00002" in g.name and g != ggufs[0]]
-            paths.ple_gguf = str(rest[0]) if rest else ""
+            paths.ple_gguf = str(rest[0].resolve()) if rest else ""
         for cand in (b / "mtp" / "rt", b / "mtp"):
             if cand.is_dir():
-                paths.mtp = str(cand)
+                paths.mtp = str(cand.resolve())
                 break
         cvec = b / "data" / "experimental-speed-projection"
         hit = next(iter(cvec.glob("*.gguf")), None) if cvec.is_dir() else None
         if hit:
-            paths.cvec_scaled = f"{hit}:1.0"
+            paths.cvec_scaled = f"{hit.resolve()}:1.0"
         prof = b / "data" / "expert-profile.bin"
         if prof.exists():
-            paths.expert_profile = str(prof)
+            paths.expert_profile = str(prof.resolve())
         prompt = b / "bench" / "results" / "exchange-rotation-token-ids.json"
         if prompt.exists():
-            paths.prompt_tokens = str(prompt)
+            paths.prompt_tokens = str(prompt.resolve())
         found.append(paths)
 
     # Prefer the base that has both the pack and the weights; otherwise merge what exists.

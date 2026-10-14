@@ -42,7 +42,7 @@ from search_space import (
     engine_args,
     resolve_model_paths,
 )
-from strata_env import candidate_roots, engine_binary, server_engine_name, strata_root
+from strata_env import abs_path, candidate_roots, engine_binary, server_engine_name, strata_root
 
 STUB = HERE / "stub_engine.py"
 
@@ -118,14 +118,40 @@ def test_parse_info_extracts_what_the_engine_applied():
     assert info == {"context": "131072", "kv": "k8v4", "pool_workers": "16", "pcie_frac": "0.95"}
 
 
+def test_the_deliverable_omits_prompt_cache_tail():
+    """--prompt-cache-tail is a sweep measurement flag, not a Strata run-config key."""
+    from run_config import clean_args
+    assert "--prompt-cache-tail" not in clean_args(
+        ["--pack", "/p", "--kv", "int8", "--prompt-cache-tail", "--pool-workers", "4"])
+
+
+def test_a_pinned_dimension_is_held_constant():
+    code, out = _run(["--gen", "--kv", "int8", "--worker", "4", "--draft-floor", "0.5",
+                      "--trials", "6", "--seed", "3"])
+    assert code == 0
+    record = _record(out)
+    assert record["trials"]
+    for trial in record["trials"]:
+        assert trial["cfg"]["kv"] == "int8"
+        assert int(trial["cfg"]["worker"]) == 4
+        assert abs(float(trial["cfg"]["draft_floor"]) - 0.5) < 1e-9
+    cfg = json.loads((out / "max_run_q2_0.json").read_text(encoding="utf-8"))
+    args = cfg["args"]
+    assert args[args.index("--kv") + 1] == "int8"
+    assert args[args.index("--pool-workers") + 1] == "4"
+    assert args[args.index("--spec-min-p") + 1] == "0.5"
+    assert "--prompt-cache-tail" not in args
+
+
 def test_engine_args_covers_every_swept_dimension():
     cfg = {"vram": 768, "pcie": 0.9, "ple_io": "ram", "kv": "k8v4", "kvgrow": "1",
-           "host_core": "first", "affinity": "auto", "worker": 12, "tail": "1"}
+           "host_core": "first", "affinity": "auto", "worker": 12, "tail": "1",
+           "draft_floor": 0.5}
     args = engine_args(cfg, {"pack": "/p", "native": "/n"}, 131072, 512)
     for flag, value in (("--vram-reserve-mib", "768"), ("--pcie-frac", "0.9"),
                         ("--ple-io", "ram"), ("--kv", "k8v4"), ("--host-core", "first"),
                         ("--pool-affinity", "auto"), ("--pool-workers", "12"),
-                        ("--max-context", "131072")):
+                        ("--max-context", "131072"), ("--spec-min-p", "0.5")):
         assert flag in args, f"{flag} missing"
         assert args[args.index(flag) + 1] == value
     assert "--kv-grow" in args and "--prompt-cache-tail" in args
@@ -137,10 +163,13 @@ def test_engine_args_covers_every_swept_dimension():
 def test_the_space_is_the_ten_columns_the_brief_names():
     params = build_space(max_workers=8)
     keys = {p.key for p in params}
-    assert keys == {"vram", "pcie", "ple_io", "kv", "kvgrow", "host_core", "affinity", "worker", "tail"}
-    assert ROW_COLUMNS[:10] == ("layer", "vram", "pcie", "ple_io", "kv", "kvgrow",
-                               "hostcore", "affinity", "worker", "tail")
-    assert ROW_COLUMNS[10] == "status"
+    assert keys == {"vram", "pcie", "ple_io", "kv", "kvgrow", "host_core", "affinity",
+                    "worker", "tail", "draft_floor"}
+    assert ROW_COLUMNS[:11] == ("layer", "vram", "pcie", "ple_io", "kv", "kvgrow",
+                               "hostcore", "affinity", "worker", "tail", "draft_floor")
+    assert ROW_COLUMNS[11] == "status"
+    floor = next(p for p in params if p.key == "draft_floor")
+    assert floor.low == 0.001 and floor.high == 1.0 and floor.flag == "--spec-min-p"
     # The worker grid is capped at physical cores, and 0 (the engine's "all cores") is a legal arm.
     worker = next(p for p in params if p.key == "worker")
     assert worker.grid()[0] == 0 and worker.grid()[-1] == 7
@@ -209,25 +238,32 @@ def test_the_sweep_runs_and_writes_both_deliverables():
                 "host", "api_key"):
         assert key in cfg, f"run config missing {key}"
     assert "--serve" not in cfg["args"] and "--max-new" not in cfg["args"]
+    assert "--prompt-cache-tail" not in cfg["args"]
     assert cfg["args"].count("--max-context") == 1
     assert cfg["args"][cfg["args"].index("--max-context") + 1] == "131072"
     tuned = cfg["tuned_by"]
     assert tuned["objective"] == "gen"
     assert tuned["context"] == 131072
-    for key in ("vram", "pcie", "ple_io", "kv", "kvgrow", "host_core", "affinity", "worker", "tail"):
+    for key in ("vram", "pcie", "ple_io", "kv", "kvgrow", "host_core", "affinity",
+                "worker", "tail", "draft_floor"):
         assert key in tuned["best"]
+    args = cfg["args"]
+    assert "--spec-min-p" in args
+    floor = float(args[args.index("--spec-min-p") + 1])
+    assert 0.001 <= floor <= 1.0
     assert tuned["metrics"]["gen_tok_s"] > 0
     record = _record(out)
     assert record["schema"] == "hypercore.max_run/1"
     assert record["study"]["measured"] == 12
     assert len(record["trials"]) == 12
     # The launcher must be valid shell and executable.
-    subprocess.run(["bash", "-n", str(sh)], check=True)
-    assert os.access(sh, os.X_OK)
+    _bash_n(sh)
+    if os.name != "nt":
+        assert os.access(sh, os.X_OK)
     csvs = list((out / "results").glob("bayesian-*.csv"))
     assert csvs, "no CSV written"
     header = csvs[0].read_text(encoding="utf-8").splitlines()[0]
-    assert header.split(",")[:11] == list(ROW_COLUMNS)
+    assert header.split(",")[:12] == list(ROW_COLUMNS)
 
 
 def test_the_search_is_deterministic_for_a_seed():
@@ -322,16 +358,27 @@ def test_ctrl_c_keeps_the_best_configuration_measured_so_far():
         "--history-dir", str(out / "history"),
     ]
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    time.sleep(3.0)          # a few trials have completed by now
+    # Wait until at least one trial has started, otherwise SIGINT can land in import.
+    deadline = time.monotonic() + 30
+    buf: list[str] = []
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline() if proc.stdout is not None else ""
+        if line:
+            buf.append(line)
+            if "trial" in line:
+                break
+        elif proc.poll() is not None:
+            break
     proc.send_signal(signal.SIGINT)
-    stdout, stderr = proc.communicate(timeout=30)
+    rest_out, stderr = proc.communicate(timeout=30)
+    stdout = "".join(buf) + (rest_out or "")
     assert proc.returncode == 0, stdout + stderr
     assert "interrupted" in stdout
     record = _record(out)
     assert record["interrupted"] is True
     assert record["study"]["measured"] >= 1
     assert (out / "max_run_q2_0.sh").exists()
-    subprocess.run(["bash", "-n", str(out / "max_run_q2_0.sh")], check=True)
+    _bash_n(out / "max_run_q2_0.sh")
 
 
 def test_the_generated_launcher_is_the_project_startup_pair():
@@ -355,8 +402,9 @@ def test_the_generated_launcher_is_the_project_startup_pair():
     assert f'"--config" "{cfg_path}"' in lines[-1]
     assert '"--port" "8090"' in lines[-1]
     assert "--turn-tail-check" not in lines[-1], "the stand-in server has no such flag"
-    subprocess.run(["bash", "-n", str(launcher)], check=True)
-    assert os.access(launcher, os.X_OK)
+    _bash_n(launcher)
+    if os.name != "nt":
+        assert os.access(launcher, os.X_OK)
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert cfg["port"] == 8090
     assert cfg["exe"] == str(STUB)
@@ -388,7 +436,7 @@ def test_a_flag_the_local_server_does_not_have_is_left_out():
     assert "turn_tail_check" not in cfg, "a key the server cannot read is dead weight"
     launcher_path = out / "max_run_q2_0.sh"
     assert "--turn-tail-check" not in launcher_path.read_text(encoding="utf-8")
-    subprocess.run(["bash", "-n", str(launcher_path)], check=True)
+    _bash_n(launcher_path)
 
 
 def test_a_flag_the_local_server_does_have_is_kept():
@@ -451,18 +499,31 @@ def test_the_run_config_keeps_what_the_model_config_already_has():
     assert cfg["tuned_by"]["objective"] == "gen"
 
 
+def _bash_n(path: Path) -> None:
+    bash = shutil.which("bash")
+    if bash:
+        subprocess.run([bash, "-n", str(path)], check=True)
+
+
 def test_the_entry_point_is_executable_and_the_tree_is_gitignored():
     sh = HERE / "max_tune.sh"
-    assert sh.exists() and os.access(sh, os.X_OK)
-    subprocess.run(["bash", "-n", str(sh)], check=True)
+    bat = HERE / "max_tune.bat"
+    assert sh.exists()
+    assert bat.exists()
+    if os.name != "nt":
+        assert os.access(sh, os.X_OK)
+    _bash_n(sh)
+    text = bat.read_text(encoding="utf-8")
+    assert "bayesian_tune.py" in text
+    assert r".venv\Scripts\python.exe" in text
     own = (HERE / ".gitignore").read_text(encoding="utf-8")
     for rule in ("results/", "history/", "max_run_*.sh", "max_run_*.json", "max_run_*.bat"):
         assert rule in own, f"missing ignore rule in the repository: {rule}"
     project = Path(os.environ["STRATA_ROOT"]) / ".gitignore"
     if project.is_file():
-        text = project.read_text(encoding="utf-8")
+        gitignore = project.read_text(encoding="utf-8")
         for rule in ("/max_run_*.sh", "/max_run_*.json", "/max_run_*.bat"):
-            assert rule in text, f"the project .gitignore does not ignore the deliverables: {rule}"
+            assert rule in gitignore, f"the project .gitignore does not ignore the deliverables: {rule}"
 
 
 # ---- where the project is, and how absolute the written paths are ---------------
@@ -514,6 +575,130 @@ def test_a_sibling_checkout_is_found_when_the_clone_is_alone(monkeypatch):
     finally:
         strata_root.cache_clear()
         os.environ["STRATA_ROOT"] = str(FAKE_ROOT)
+
+
+def _make_checkout(path: Path) -> Path:
+    (path / "serve").mkdir(parents=True, exist_ok=True)
+    (path / "serve" / "server.py").write_text("", encoding="utf-8")
+    (path / "CMakeLists.txt").write_text("", encoding="utf-8")
+    return path
+
+
+def _isolate_root_env(monkeypatch) -> None:
+    strata_root.cache_clear()
+    monkeypatch.delenv("STRATA_ROOT", raising=False)
+    monkeypatch.delenv("HYPERCORE_ROOT", raising=False)
+    monkeypatch.delenv("TUNE_ROOT", raising=False)
+
+
+def test_a_nested_hypercore_cpp_clone_walks_up_to_strata(monkeypatch):
+    """~/Strata/HyperCore-CPP is this app inside a Strata tree; walk-up finds Strata."""
+    tmp = Path(tempfile.mkdtemp(prefix="hc-nested-cpp-"))
+    project = _make_checkout(tmp / "Strata")
+    clone = project / "HyperCore-CPP"
+    clone.mkdir()
+    _isolate_root_env(monkeypatch)
+    monkeypatch.setattr(strata_env, "REPO", clone)
+    try:
+        assert strata_root() == project.resolve()
+        assert strata_root().is_absolute()
+    finally:
+        _clear_root_cache()
+
+
+def test_a_standalone_hypercore_cpp_clone_finds_sibling_strata(monkeypatch):
+    """~/HyperCore-CPP next to ~/Strata: this app is standalone, Strata is the sibling."""
+    tmp = Path(tempfile.mkdtemp(prefix="hc-standalone-cpp-"))
+    project = _make_checkout(tmp / "Strata")
+    clone = tmp / "HyperCore-CPP"
+    clone.mkdir()
+    _isolate_root_env(monkeypatch)
+    monkeypatch.setattr(strata_env, "REPO", clone)
+    try:
+        assert strata_root() == project.resolve()
+        assert strata_root().is_absolute()
+    finally:
+        _clear_root_cache()
+
+
+def test_abs_path_expands_home_and_windows_vars(monkeypatch):
+    home = Path(tempfile.mkdtemp(prefix="hc-abs-home-"))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    target = abs_path("~/HyperCore-CPP")
+    assert target is not None
+    assert target.is_absolute()
+    assert target == (home / "HyperCore-CPP").resolve()
+    assert "~" not in str(target)
+    via_var = abs_path("%USERPROFILE%\\HyperCore-CPP")
+    assert via_var == (home / "HyperCore-CPP").resolve()
+
+
+def test_a_tilde_strata_root_is_absolute(monkeypatch):
+    home = Path(tempfile.mkdtemp(prefix="hc-tilde-home-"))
+    project = _make_checkout(home / "Strata")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    strata_root.cache_clear()
+    monkeypatch.setenv("STRATA_ROOT", "~/Strata")
+    monkeypatch.delenv("HYPERCORE_ROOT", raising=False)
+    monkeypatch.delenv("TUNE_ROOT", raising=False)
+    try:
+        assert strata_root() == project.resolve()
+        assert strata_root().is_absolute()
+    finally:
+        _clear_root_cache()
+
+
+def test_relative_cli_paths_become_absolute(monkeypatch):
+    tmp = Path(tempfile.mkdtemp(prefix="hc-rel-cli-"))
+    pack = tmp / "pack"
+    pack.mkdir()
+    (pack / "tokenizer").mkdir()
+    native = tmp / "tiny.gguf"
+    native.write_text("x", encoding="utf-8")
+    monkeypatch.chdir(tmp)
+    out = tmp / "out"
+    code = main([
+        "--model", "q2_0", "--engine", os.path.relpath(STUB, tmp),
+        "--strata-root", str(FAKE_ROOT),
+        "--pack", "pack", "--native", "tiny.gguf",
+        "--prompt-tokens-file", str(HERE / "fixtures" / "prompt.json"),
+        "--deliverable-dir", "out", "--results-dir", str(out / "results"),
+        "--history-dir", str(out / "history"),
+        "--max-workers", "8", "--trials", "3", "--seed", "7", "--gen",
+    ])
+    assert code == 0
+    cfg = json.loads((out / "max_run_q2_0.json").read_text(encoding="utf-8"))
+    assert Path(cfg["exe"]).is_absolute()
+    assert Path(cfg["args"][cfg["args"].index("--pack") + 1]).is_absolute()
+    assert Path(cfg["args"][cfg["args"].index("--native") + 1]).is_absolute()
+
+
+def test_cpu_probe_survives_without_proc_or_uname(monkeypatch):
+    import hardware as hardware_mod
+    from hardware import detect_cpu
+    monkeypatch.setattr(hardware_mod, "_read", lambda path: "")
+    def _no_uname():
+        raise AttributeError("uname")
+    monkeypatch.setattr(os, "uname", _no_uname, raising=False)
+    name, phys, logical = detect_cpu()
+    assert logical >= 1
+    assert isinstance(name, str) and name
+
+
+def test_windows_appdata_settings_are_read(monkeypatch):
+    from search_space import settings_data_dir
+    tmp = Path(tempfile.mkdtemp(prefix="hc-appdata-"))
+    appdata = tmp / "AppData" / "Roaming"
+    data = tmp / "Strata-data"
+    data.mkdir(parents=True)
+    (appdata / "strata").mkdir(parents=True)
+    (appdata / "strata" / "settings.json").write_text(
+        json.dumps({"data_dir": str(data)}), encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert settings_data_dir() == str(data.resolve())
 
 
 def test_a_clone_with_no_project_nearby_says_so(monkeypatch):
@@ -612,11 +797,22 @@ def test_pci_generation_is_read_from_sysfs_when_lspci_is_absent():
     assert pci_from_sysfs("/no/such/dir") == (0, 0)
 
 
+def test_old_history_without_draft_floor_still_loads():
+    from history import normalise_trial
+    row = {"cfg": {"vram": 512, "pcie": 0.5, "ple_io": "ram", "kv": "int8", "kvgrow": "0",
+                   "host_core": "first", "affinity": "all", "worker": 4, "tail": "0"},
+           "score": 1.0, "status": "PASS", "spec_min_p": 0.8}
+    trial = normalise_trial(row, 512, 0.8)
+    assert trial is not None
+    assert abs(float(trial["cfg"]["draft_floor"]) - 0.8) < 1e-9
+
+
 def test_history_merge_keeps_the_best_score_for_each_configuration():
     from hardware import hardware_from
     from history import merge
     cfg = {"vram": 512, "pcie": 0.5, "ple_io": "ram", "kv": "int8", "kvgrow": "0",
-           "host_core": "first", "affinity": "all", "worker": 4, "tail": "0"}
+           "host_core": "first", "affinity": "all", "worker": 4, "tail": "0",
+           "draft_floor": 0.8}
 
     def record(score):
         return {"model": "q2_0", "objective": "gen", "context": 131072, "max_new": 512,
@@ -648,25 +844,29 @@ def test_a_sweep_writes_run_data_named_after_the_machine():
     assert data["context"] == 131072 and data["objective"] == "gen"
     assert len(data["trials"]) == 3
     assert all(t["cfg"].keys() == {"vram", "pcie", "ple_io", "kv", "kvgrow",
-                                   "host_core", "affinity", "worker", "tail"}
+                                   "host_core", "affinity", "worker", "tail", "draft_floor"}
                for t in data["trials"])
     csvs = list((out / "results").glob("bayesian-*.csv"))
     assert any(PINNED_SLUG in c.name for c in csvs)
 
 
-def test_a_second_sweep_reuses_the_configurations_it_already_measured():
+def test_a_second_sweep_does_not_reboot_known_points_and_keeps_drawing():
+    """The same seed would re-ask the first six points; those are pruned, not counted,
+    and the sweep keeps drawing until six unseen configurations have been booted."""
     out = Path("/tmp/hc-optuna-reuse")
     argv = ["--hardware", PINNED, "--sampler", "random", "--trials", "6", "--seed", "11"]
     _run(argv, out)
-    boots = len(list((out / "results").glob("run-*.log")))
-    assert boots == 6
+    first_logs = {p.name for p in (out / "results").glob("run-*.log")}
+    assert len(first_logs) == 6
     code, _ = _run(argv, out, fresh=False)
     assert code == 0
     record = _record(out)
+    second_logs = {p.name for p in (out / "results").glob("run-*.log")}
     assert record["history"]["trials_loaded"] == 6
-    assert record["history"]["reused"] == 6
-    assert record["study"]["measured"] == 0
-    assert len(list((out / "results").glob("run-*.log"))) == boots
+    assert record["history"]["duplicates_skipped"] >= 6
+    assert record["study"]["measured"] == 6
+    assert first_logs <= second_logs, "the original six boots must not be repeated"
+    assert len(second_logs - first_logs) == 6
     assert record["best"], "the winner must still come from the stored data"
     assert (out / "max_run_q2_0.sh").exists() and (out / "max_run_q2_0.json").exists()
 
@@ -681,9 +881,11 @@ def test_run_data_from_another_machine_is_not_used():
          out, fresh=False)
     assert _record(out)["history"]["trials_loaded"] == 3
 
+    already = sum(len(json.loads(p.read_text(encoding="utf-8"))["trials"])
+                  for p in (out / "history").glob("*.json"))
     _run(["--hardware", PINNED, "--sampler", "random", "--trials", "3", "--seed", "4",
           "--allow-hardware-mismatch"], out, fresh=False)
-    assert _record(out)["history"]["trials_loaded"] == 6
+    assert _record(out)["history"]["trials_loaded"] == already
 
 
 def test_a_prior_outside_the_current_grid_is_skipped_not_clamped():

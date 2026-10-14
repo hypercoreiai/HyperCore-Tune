@@ -42,6 +42,7 @@ def main() -> int:
     workers = int(flags.get("--pool-workers", "0")) or 16
     kv_grow = flags.get("--kv-grow", "0")
     tail = flags.get("--prompt-cache-tail", "0")
+    draft = float(flags.get("--spec-min-p", "0.8"))
 
     if vram < 256 or vram > 2048:
         print("hypercore error: vram reserve out of range")
@@ -60,6 +61,7 @@ def main() -> int:
         gen += 3.0
     if vram < 512:
         gen -= 25.0
+    gen += 8.0 * max(0.0, 1.0 - abs(draft - 0.5) / 0.5)
     gen = max(20.0, gen)
 
     prefill = 900.0 * (1.15 if ple == "ram" else 1.0 if ple == "direct" else 0.7)

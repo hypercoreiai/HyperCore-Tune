@@ -14,7 +14,16 @@
 #   --latency  minimise prompt_ms + decode_ms
 #
 # The dimensions searched are the columns every row is written with:
-#   layer  vram  pcie  ple-io  kv  kvgrow  hostcore  affinity  worker  tail  status
+#   layer  vram  pcie  ple-io  kv  kvgrow  hostcore  affinity  worker  tail  draft-floor  status
+#
+# Hold a dimension constant instead of searching it:
+#   --pcie --ple-io --kv --kvgrow --hostcore --affinity --worker --tail --draft-floor
+# --draft-floor is --spec-min-p on the engine, searched in [0.001, 1] unless pinned.
+# --prompt-cache-tail is measured when tail is searched, but never written into the
+# deliverable (the default Strata interface does not accept it).
+#
+# --trials is unseen configurations: a repeat of a point already in history is redrawn
+# and does not count.
 #
 # Deliverables, at the Strata project root, in the project's own run-config format:
 #   max_run_<model>.sh / .bat   the startup script: serve/server.py with the winning config
@@ -24,7 +33,8 @@
 #
 # Run data is kept per machine in HyperCore-Tune/history/, named
 #   <CPU>_<GPU>_<RAM>_<PCIe>x<width>_<model>_<objective>_<cntx>.json
-# so a sweep on the same box reuses what it already measured instead of booting again.
+# so a sweep on the same box reuses what it already measured instead of booting again,
+# and keeps drawing until --trials new points have been evaluated.
 #   --no-load                   start the study cold
 #   --allow-hardware-mismatch   load run data from a different machine too
 #   --hardware '<json>'         pin the fingerprint instead of probing the host
@@ -34,12 +44,13 @@
 #
 # The Strata root is resolved in the same order as the Python side: $STRATA_ROOT, then the
 # nearest ancestor of this repository that is a Strata checkout, then a sibling named
-# Strata. Every path the sweep writes is absolute.
+# Strata / HyperCore. A value that starts with ~ is expanded. Every path the sweep writes
+# is absolute, so this script works from ~/Strata/HyperCore-Tune and from ~/HyperCore-CPP.
 #
-# The Python side runs under the project venv: setup.sh/install.sh create .venv and install
-# requirements.txt into it. If .venv is missing the system python3 is used and the script
-# says so. optuna is not in the project requirements because the sweep is optional;
-# --install adds it.
+# The Python side runs under the project venv: setup.sh/install.sh create .venv.
+# If .venv is missing the system python3 is used and the script says so. optuna lives in
+# this repository's requirements.txt (not Strata's); --install adds it to the venv.
+# On Windows 10/11 the same flags go to max_tune.bat.
 #
 # Requires: bash 4.4+, a free GPU for a real run (stop the server with ./restart.sh first).
 
@@ -47,23 +58,60 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Turn a user path into an absolute one. ~ is not expanded once it lives in a variable.
+abs_path() {
+    local p="$1"
+    case "$p" in
+        ~) p="$HOME" ;;
+        ~/*) p="$HOME/${p#~/}" ;;
+    esac
+    if [ -d "$p" ]; then
+        (cd "$p" && pwd)
+        return 0
+    fi
+    case "$p" in
+        /*) printf '%s\n' "$p" ;;
+        *) printf '%s/%s\n' "$(pwd)" "$p" ;;
+    esac
+}
+
+is_strata_root() {
+    local d="$1"
+    [ -f "$d/serve/server.py" ] || return 1
+    [ -f "$d/setup.py" ] || [ -f "$d/CMakeLists.txt" ] || [ -f "$d/src/program/generate.cpp" ]
+}
+
 find_root() {
-    if [ -n "${STRATA_ROOT:-}" ]; then printf '%s\n' "$STRATA_ROOT"; return 0; fi
-    if [ -n "${HYPERCORE_ROOT:-}" ]; then printf '%s\n' "$HYPERCORE_ROOT"; return 0; fi
+    local cand d name
+    if [ -n "${STRATA_ROOT:-}" ]; then abs_path "$STRATA_ROOT"; return 0; fi
+    if [ -n "${HYPERCORE_ROOT:-}" ]; then abs_path "$HYPERCORE_ROOT"; return 0; fi
+    if [ -n "${TUNE_ROOT:-}" ]; then abs_path "$TUNE_ROOT"; return 0; fi
     d="$HERE"
     while [ "$d" != "/" ]; do
         d="$(dirname "$d")"
-        if [ -f "$d/serve/server.py" ] && [ -f "$d/CMakeLists.txt" ]; then
+        if is_strata_root "$d"; then
             printf '%s\n' "$d"
             return 0
         fi
     done
-    for cand in "$HERE/../Strata" "$HERE/../HyperCore" "$HERE/../../Strata"; do
-        if [ -f "$cand/serve/server.py" ]; then
-            (cd "$cand" && printf '%s\n' "$(pwd)")
+    for name in Strata HyperCore hypercore strata; do
+        cand="$HERE/../$name"
+        if is_strata_root "$cand"; then
+            abs_path "$cand"
             return 0
         fi
     done
+    for cand in "$HERE"/../*; do
+        if is_strata_root "$cand"; then
+            abs_path "$cand"
+            return 0
+        fi
+    done
+    cand="$HERE/../../Strata"
+    if is_strata_root "$cand"; then
+        abs_path "$cand"
+        return 0
+    fi
     return 1
 }
 
@@ -79,8 +127,10 @@ pick_python() {
         printf '%s\n' "$TUNE_PYTHON"
         return 0
     fi
-    for p in "$VENV/bin/python" "$VENV/bin/python3" \
-            "$ROOT/venv/bin/python" "$(command -v python3 2>/dev/null || true)"; do
+    for p in "$VENV/bin/python" "$VENV/bin/python3" "$VENV/Scripts/python.exe" \
+            "$ROOT/venv/bin/python" "$ROOT/venv/Scripts/python.exe" \
+            "$(command -v python3 2>/dev/null || true)" \
+            "$(command -v python 2>/dev/null || true)"; do
         [ -n "$p" ] && [ -x "$p" ] || continue
         printf '%s\n' "$p"
         return 0

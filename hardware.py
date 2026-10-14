@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -113,7 +114,15 @@ def detect_cpu() -> tuple[str, int, int]:
             model = line.split(":", 1)[1].strip()
             break
     if not model:
-        model = os.uname().machine or UNKNOWN
+        try:
+            model = (platform.processor() or platform.machine() or "").strip()
+        except Exception:  # noqa: BLE001 - a probe that cannot answer must not stop the sweep
+            model = ""
+    if not model:
+        try:
+            model = os.uname().machine  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            model = ""
 
     logical = os.cpu_count() or 0
     physical = 0
